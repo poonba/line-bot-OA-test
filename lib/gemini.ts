@@ -3,7 +3,25 @@ import { GoogleGenAI } from '@google/genai';
 export const DEFAULT_REPLY =
   'ขออภัยค่ะ เรื่องนี้ทางร้านขอเช็คให้ก่อนนะคะ เดี๋ยวแอดมินมาตอบเพิ่มเติมค่ะ 🙏';
 
-const GEMINI_TIMEOUT_MS = 8_000;
+const GEMINI_TIMEOUT_MS = 12_000;
+const MAX_TRIES = 3;
+
+async function callWithRetry<T>(fn: () => Promise<T>, tries = MAX_TRIES): Promise<T> {
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const e = err as { error?: { code?: number }; status?: number; message?: string };
+      const code = e?.error?.code ?? e?.status;
+      const retriable =
+        code === 503 || code === 429 || /timeout/i.test(String(e?.message ?? ''));
+      if (!retriable || i === tries - 1) throw err;
+      console.warn(`[gemini] retry ${i + 1}/${tries - 1} (code=${code})`);
+      await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  throw new Error('unreachable');
+}
 
 export async function askGemini(faqCsv: string, userMessage: string): Promise<string> {
   const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY! });
@@ -38,16 +56,18 @@ ${faqCsv}
 ${userMessage}
 </question>`;
 
-  const result = await Promise.race([
-    ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-      config: { temperature: 1.0, maxOutputTokens: 1024 },
-    }),
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Gemini timeout (8s)')), GEMINI_TIMEOUT_MS)
-    ),
-  ]);
+  const result = await callWithRetry(() =>
+    Promise.race([
+      ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: prompt,
+        config: { temperature: 1.0, maxOutputTokens: 1024 },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('Gemini timeout')), GEMINI_TIMEOUT_MS)
+      ),
+    ])
+  );
 
   const candidate = result.candidates?.[0];
   console.log('[gemini]', {
